@@ -162,6 +162,10 @@ nanobot --version
 **uv**
 
 ```bash
+uv pip install -e .
+```
+
+```bash
 uv tool upgrade nanobot-ai
 nanobot --version
 ```

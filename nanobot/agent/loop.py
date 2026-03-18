@@ -64,6 +64,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        gemini_image_config: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -95,6 +96,7 @@ class AgentLoop:
         )
 
         self._running = False
+        self._gemini_image_config = gemini_image_config
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -132,6 +134,27 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        # PPT storyboard tools
+        from nanobot.agent.tools.ppt_storyboard import PptStoryboardScriptTool, PptStoryboardAssetsTool
+        script_tool = PptStoryboardScriptTool(
+            provider=self.provider, model=self.model,
+            send_callback=self.bus.publish_outbound,
+        )
+        self.tools.register(script_tool)
+        gemini_svc = None
+        if self._gemini_image_config and getattr(self._gemini_image_config, "api_key", ""):
+            from nanobot.services.gemini_image import GeminiImageService
+            gemini_svc = GeminiImageService(
+                api_base=self._gemini_image_config.api_base or self.provider.api_base or "",
+                api_key=self._gemini_image_config.api_key,
+                model=self._gemini_image_config.model,
+                timeout=self._gemini_image_config.timeout,
+            )
+        self.tools.register(PptStoryboardAssetsTool(
+            provider=self.provider, model=self.model,
+            gemini_service=gemini_svc, script_tool=script_tool,
+            send_callback=self.bus.publish_outbound,
+        ))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -157,10 +180,13 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+        for name in self.tools.tool_names:
+            tool = self.tools.get(name)
+            if tool and hasattr(tool, "set_context"):
+                if name == "message":
+                    tool.set_context(channel, chat_id, message_id)
+                else:
+                    tool.set_context(channel, chat_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -227,14 +253,15 @@ class AgentLoop:
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, tool_call.name, result,
+                        extra_fields=tool_call.provider_specific_fields,
                     )
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
+                    logger.error("LLM returned error: {}", clean or "")
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
@@ -448,7 +475,7 @@ class AgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        preview = final_content[:500] + "..." if len(final_content) > 500 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,

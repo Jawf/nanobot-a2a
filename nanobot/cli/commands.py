@@ -505,6 +505,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        gemini_image_config=config.tools.gemini_image,
     )
 
     # Set cron callback (needs agent)
@@ -696,6 +697,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        gemini_image_config=config.tools.gemini_image,
     )
 
     # Shared reference for progress callbacks
@@ -1044,6 +1046,62 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+
+@app.command()
+def diagnose(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Diagnose model/provider resolution — helps fix '模型没有匹配成功' errors."""
+    from nanobot.config.loader import get_config_path, load_config, set_config_path
+
+    config_path = config
+    if config_path:
+        config_path = Path(config_path).expanduser().resolve()
+        if not config_path.exists():
+            console.print(f"[red]Error: Config not found: {config_path}[/red]")
+            raise typer.Exit(1)
+        set_config_path(config_path)
+    else:
+        config_path = get_config_path()
+
+    cfg = load_config(config_path)
+    model = cfg.agents.defaults.model
+    provider_name = cfg.get_provider_name(model)
+    p = cfg.get_provider(model)
+    api_base = cfg.get_api_base(model)
+
+    console.print(f"{__logo__} Model/Provider 诊断\n")
+    console.print(f"Config: {config_path}")
+    console.print(f"agents.defaults.model: [cyan]{model}[/cyan]")
+    console.print(f"agents.defaults.provider: [cyan]{cfg.agents.defaults.provider}[/cyan]")
+    console.print(f"匹配到的 provider: [cyan]{provider_name or '(无)'}[/cyan]")
+    console.print(f"api_base: [cyan]{api_base or '(默认)'}[/cyan]")
+
+    if not provider_name or not (p and p.api_key):
+        console.print("\n[red]原因：未匹配到有效的 provider 或缺少 apiKey。[/red]")
+        console.print("建议：在 config 中显式设置 provider，如 \"provider\": \"openrouter\"，并填写对应 apiKey。")
+        raise typer.Exit(1)
+
+    # Simulate LiteLLM resolution (same as LiteLLMProvider._resolve_model)
+    from nanobot.providers.registry import find_by_name, find_gateway
+    spec = find_by_name(provider_name)
+    gw = find_gateway(provider_name, p.api_key, api_base)
+    if gw:
+        resolved = model.split("/")[-1] if gw.strip_model_prefix else model
+        if gw.litellm_prefix:
+            resolved = f"{gw.litellm_prefix}/{resolved}"
+    elif spec and spec.litellm_prefix:
+        skip = any(model.startswith(s) for s in spec.skip_prefixes)
+        resolved = f"{spec.litellm_prefix}/{model}" if not skip else model
+    else:
+        resolved = model
+
+    console.print(f"实际发送给 LiteLLM 的 model: [bold green]{resolved}[/bold green]")
+    console.print("\n若仍报「模型没有匹配成功」：")
+    console.print("  1. 确认该 model 在你的 API 提供方文档中支持（如 AiHubMix 需用其模型列表中的 ID）")
+    console.print("  2. 推荐改用 OpenRouter：provider=openrouter, model=anthropic/claude-3.5-sonnet")
+    console.print("  3. 启动 gateway 时加 --verbose 查看完整请求日志")
 
 
 # ============================================================================

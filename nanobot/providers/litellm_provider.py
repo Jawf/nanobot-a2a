@@ -277,13 +277,24 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
+        gateway_or_provider = (self._gateway.name if self._gateway else "standard") + f" (original: {original_model})"
+        logger.info("LLM request: model={}, provider={}, api_base={}", model, gateway_or_provider, (self.api_base or "(default)")[:80])
+
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
+            err_str = str(e)
+            hint = ""
+            if "模型没有匹配成功" in err_str or "请输入正确模型" in err_str:
+                hint = (
+                    "\n\n【排查提示】该错误通常来自 AiHubMix / 硅基流动等网关，说明当前 model 不被支持。"
+                    " 请：1) 固定 provider，如 \"provider\": \"openrouter\" 或 \"openai\"；"
+                    " 2) 使用该网关文档中的正确模型 ID（如 OpenRouter 用 anthropic/claude-3.5-sonnet）；"
+                    " 3) 运行 nanobot diagnose 查看实际发送的模型与网关。"
+                )
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=f"Error calling LLM: {err_str}{hint}",
                 finish_reason="error",
             )
 

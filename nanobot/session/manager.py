@@ -85,10 +85,11 @@ class Session:
 
         out: list[dict[str, Any]] = []
         for message in sliced:
-            entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
-            for key in ("tool_calls", "tool_call_id", "name"):
-                if key in message:
-                    entry[key] = message[key]
+            entry: dict[str, Any] = {
+                k: v for k, v in message.items()
+                if k != "timestamp"  # strip internal metadata only
+            }
+            entry.setdefault("content", "")
             out.append(entry)
         return out
 

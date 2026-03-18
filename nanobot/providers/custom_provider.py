@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+
+# Max chars kept per tool result when collapsing into assistant content.
+_TOOL_RESULT_INLINE_MAX = 4000
 
 
 class CustomProvider(LLMProvider):
@@ -22,8 +27,6 @@ class CustomProvider(LLMProvider):
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
-        # Keep affinity stable for this provider instance to improve backend cache locality,
-        # while still letting users attach provider-specific headers for custom gateways.
         default_headers = {
             "x-session-affinity": uuid.uuid4().hex,
             **(extra_headers or {}),
@@ -34,13 +37,100 @@ class CustomProvider(LLMProvider):
             default_headers=default_headers,
         )
 
+    # ------------------------------------------------------------------
+    # Message pre-processing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collapse_tool_rounds(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse (assistant+tool_calls, tool_results…) into plain assistant messages.
+
+        Many OpenAI-compatible gateways (e.g. ymcas-ai wrapping Gemini) do **not**
+        pass ``thought_signature`` through.  Gemini thinking models then reject
+        subsequent requests because the echoed assistant tool-call message lacks
+        the signature.
+
+        The workaround: before sending to the API, replace every completed
+        tool-call round with a single assistant message whose *content* embeds
+        the tool names, arguments and results in human-readable form.  The model
+        receives exactly the same information; it just isn't in the formal
+        ``tool_calls`` / ``tool`` message format.
+
+        The current (last) round is collapsed too — the model already returned
+        the tool call in a previous iteration of the agent loop, so it already
+        "knows" it called the tool; we just need to feed the result back.
+        """
+        out: list[dict[str, Any]] = []
+        i = 0
+        n = len(messages)
+        while i < n:
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+                tc_ids = {
+                    tc["id"] for tc in tool_calls
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+
+                # Gather consecutive tool-result messages that belong to this round.
+                j = i + 1
+                results: dict[str, str] = {}
+                while j < n and messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id")
+                    if tid in tc_ids:
+                        results[tid] = messages[j].get("content", "")
+                    j += 1
+
+                # Build a plain-text summary.
+                parts: list[str] = []
+                if msg.get("content"):
+                    parts.append(msg["content"])
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "?")
+                    args = fn.get("arguments", "{}")
+                    res = results.get(tc.get("id", ""), "(no result)")
+                    if isinstance(res, str) and len(res) > _TOOL_RESULT_INLINE_MAX:
+                        res = res[:_TOOL_RESULT_INLINE_MAX] + "…(truncated)"
+                    parts.append(f"[Called tool `{name}` with args: {args}]\n[Result: {res}]")
+
+                out.append({
+                    "role": "assistant",
+                    "content": "\n\n".join(parts) or "(tool executed)",
+                })
+                i = j  # skip past consumed tool-result messages
+                continue
+
+            # Skip orphan tool-result messages whose assistant round was
+            # already collapsed (or never present).
+            if msg.get("role") == "tool":
+                i += 1
+                continue
+
+            out.append(msg)
+            i += 1
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Chat
+    # ------------------------------------------------------------------
+
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
                    reasoning_effort: str | None = None,
                    tool_choice: str | dict[str, Any] | None = None) -> LLMResponse:
+        clean = self._sanitize_empty_content(messages)
+
+        # Collapse prior tool-call rounds so Gemini thinking models don't
+        # reject the request for missing thought_signature.
+        clean = self._collapse_tool_rounds(clean)
+
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
-            "messages": self._sanitize_empty_content(messages),
+            "messages": clean,
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
@@ -53,6 +143,10 @@ class CustomProvider(LLMProvider):
         except Exception as e:
             return LLMResponse(content=f"Error: {e}", finish_reason="error")
 
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
+
     def _parse(self, response: Any) -> LLMResponse:
         if not response.choices:
             return LLMResponse(
@@ -61,11 +155,14 @@ class CustomProvider(LLMProvider):
             )
         choice = response.choices[0]
         msg = choice.message
-        tool_calls = [
-            ToolCallRequest(id=tc.id, name=tc.function.name,
-                            arguments=json_repair.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments)
-            for tc in (msg.tool_calls or [])
-        ]
+        tool_calls = []
+        for tc in (msg.tool_calls or []):
+            args = tc.function.arguments
+            if isinstance(args, str):
+                args = json_repair.loads(args)
+            tool_calls.append(ToolCallRequest(
+                id=tc.id, name=tc.function.name, arguments=args,
+            ))
         u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
@@ -75,4 +172,3 @@ class CustomProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
-

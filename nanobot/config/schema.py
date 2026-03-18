@@ -141,6 +141,15 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
+class GeminiImageConfig(Base):
+    """Gemini image generation API configuration."""
+
+    api_base: str = ""  # e.g. "https://ymcas-d.yxt.com/ymcas-ai/multi-model/v1"
+    api_key: str = ""
+    model: str = "gemini-3.1-flash-image-preview"
+    timeout: int = 120  # seconds for image generation
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -148,6 +157,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    gemini_image: GeminiImageConfig = Field(default_factory=GeminiImageConfig)
 
 
 class Config(BaseSettings):

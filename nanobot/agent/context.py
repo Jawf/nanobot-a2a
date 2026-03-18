@@ -168,9 +168,17 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     def add_tool_result(
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: str,
+        extra_fields: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        """Add a tool result to the message list.
+
+        *extra_fields* (e.g. ``thought_signature``) are merged at the top level
+        so providers like Gemini receive them alongside the tool result.
+        """
+        msg: dict[str, Any] = {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+        if extra_fields:
+            msg.update(extra_fields)
+        messages.append(msg)
         return messages
 
     def add_assistant_message(

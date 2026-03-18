@@ -19,8 +19,12 @@ class ToolCallRequest:
     function_provider_specific_fields: dict[str, Any] | None = None
 
     def to_openai_tool_call(self) -> dict[str, Any]:
-        """Serialize to an OpenAI-style tool_call payload."""
-        tool_call = {
+        """Serialize to an OpenAI-style tool_call payload.
+
+        Provider-specific fields (e.g. Gemini ``thought_signature``) are merged
+        at the top level so they pass through the OpenAI SDK to the API as-is.
+        """
+        tool_call: dict[str, Any] = {
             "id": self.id,
             "type": "function",
             "function": {
@@ -29,9 +33,10 @@ class ToolCallRequest:
             },
         }
         if self.provider_specific_fields:
-            tool_call["provider_specific_fields"] = self.provider_specific_fields
+            # Merge at top level for direct API pass-through
+            tool_call.update(self.provider_specific_fields)
         if self.function_provider_specific_fields:
-            tool_call["function"]["provider_specific_fields"] = self.function_provider_specific_fields
+            tool_call["function"].update(self.function_provider_specific_fields)
         return tool_call
 
 
