@@ -1,7 +1,7 @@
-"""XUI channel: A2A protocol (JSON-RPC + SSE) for XUI frontend integration.
+"""A2A channel: A2A protocol (JSON-RPC + SSE) for frontend integration.
 
-Implements the Agent-to-Agent (A2A) protocol endpoints that the XUI console
-expects, using only Python stdlib (asyncio) — no extra dependencies required.
+Implements the Agent-to-Agent (A2A) protocol endpoints, using only Python
+stdlib (asyncio) — no extra dependencies required.
 
 Endpoints
 ---------
@@ -36,8 +36,8 @@ from nanobot.config.schema import Base
 # ---------------------------------------------------------------------------
 
 
-class XuiConfig(Base):
-    """XUI channel configuration."""
+class A2aConfig(Base):
+    """A2A channel configuration."""
 
     enabled: bool = False
     host: str = "0.0.0.0"
@@ -406,26 +406,26 @@ def _sse_data(data: dict) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-class XuiChannel(BaseChannel):
-    """A2A protocol channel for XUI frontend integration.
+class A2aChannel(BaseChannel):
+    """A2A protocol channel for frontend integration.
 
-    Implements the Agent-to-Agent protocol over JSON-RPC 2.0 so that the
-    XUI console can discover the agent, send messages, and receive streaming
+    Implements the Agent-to-Agent protocol over JSON-RPC 2.0 so that
+    clients can discover the agent, send messages, and receive streaming
     responses via Server-Sent Events.
     """
 
-    name = "xui"
-    display_name = "XUI"
+    name = "a2a"
+    display_name = "A2A"
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
-        return XuiConfig().model_dump(by_alias=True)
+        return A2aConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
         if isinstance(config, dict):
-            config = XuiConfig.model_validate(config)
+            config = A2aConfig.model_validate(config)
         super().__init__(config, bus)
-        self.config: XuiConfig = config
+        self.config: A2aConfig = config
         self._server: asyncio.Server | None = None
         # chat_id -> task info
         self._tasks: dict[str, _TaskInfo] = {}
@@ -476,7 +476,7 @@ class XuiChannel(BaseChannel):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         logger.info(
-            "XUI channel (A2A) listening on http://{}:{}",
+            "A2A channel listening on http://{}:{}",
             self.config.host,
             self.config.port,
         )
@@ -493,7 +493,7 @@ class XuiChannel(BaseChannel):
         if self._server and self._server.is_serving():
             self._server.close()
             await self._server.wait_closed()
-        logger.info("XUI channel stopped")
+        logger.info("A2A channel stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
         """Receive an agent reply and route to the appropriate task."""
@@ -502,30 +502,30 @@ class XuiChannel(BaseChannel):
         is_data_message = msg.metadata.get("_data_message", False)
 
         logger.info(
-            "XUI send(): chat_id={}, is_progress={}, data_msg={}, tasks={}, content={}",
+            "A2A send(): chat_id={}, is_progress={}, data_msg={}, tasks={}, content={}",
             chat_id, is_progress, is_data_message, list(self._tasks.keys()),
             (msg.content[:80] if msg.content else "(empty)") if not is_data_message else "(data)",
         )
 
         task = self._tasks.get(chat_id)
         if not task:
-            logger.warning("XUI: no task found for chat_id={}, available={}", chat_id, list(self._tasks.keys()))
+            logger.warning("A2A: notask found for chat_id={}, available={}", chat_id, list(self._tasks.keys()))
             return
 
         if is_data_message:
             biz_data = msg.metadata.get("_biz_data", {})
             task.append_data_progress(biz_data)
-            logger.info("XUI: data message delivered to task {}", task.task_id)
+            logger.info("A2A: datamessage delivered to task {}", task.task_id)
         elif is_progress:
             task.append_progress(msg.content)
-            logger.debug("XUI: progress chunk delivered to task {}", task.task_id)
+            logger.debug("A2A: progresschunk delivered to task {}", task.task_id)
         elif _is_error_content(msg.content):
             clean = _clean_error_for_display(msg.content)
             task.fail(clean)
-            logger.warning("XUI: error response delivered to task {} — {}", task.task_id, clean)
+            logger.warning("A2A: errorresponse delivered to task {} — {}", task.task_id, clean)
         else:
             task.finish(msg.content)
-            logger.info("XUI: final response delivered to task {}", task.task_id)
+            logger.info("A2A: finalresponse delivered to task {}", task.task_id)
 
     # ------------------------------------------------------------------
     # Connection handler
@@ -580,9 +580,9 @@ class XuiChannel(BaseChannel):
                 await writer.drain()
 
         except (ConnectionResetError, BrokenPipeError) as exc:
-            logger.warning("XUI: client disconnected during request: {}", exc)
+            logger.warning("A2A: clientdisconnected during request: {}", exc)
         except Exception:
-            logger.exception("XUI: error handling request")
+            logger.exception("A2A: errorhandling request")
         finally:
             try:
                 writer.close()
@@ -608,7 +608,7 @@ class XuiChannel(BaseChannel):
         self, writer: asyncio.StreamWriter, origin: str, allowed: list[str],
     ) -> None:
         writer.write(_json_response_cors(
-            {"status": "running", "channel": "xui", "running": self._running},
+            {"status": "running", "channel": "a2a", "running": self._running},
             200, origin, allowed,
         ))
         await writer.drain()
@@ -641,7 +641,7 @@ class XuiChannel(BaseChannel):
         params = body.get("params", {})
         jsonrpc_version = body.get("jsonrpc", "")
 
-        logger.info("XUI JSON-RPC: method={}, id={}", method, req_id)
+        logger.info("A2A JSON-RPC: method={}, id={}", method, req_id)
 
         if jsonrpc_version != "2.0":
             writer.write(_json_response_cors(
@@ -693,7 +693,7 @@ class XuiChannel(BaseChannel):
         """Handle message/send: accept message, wait for full reply, return Task."""
         message = params.get("message", {})
         text = self._extract_text(message)
-        logger.info("XUI message/send: params keys={}, message keys={}", list(params.keys()), list(message.keys()))
+        logger.info("A2A message/send: params keys={}, message keys={}", list(params.keys()), list(message.keys()))
         if not text:
             writer.write(_json_response_cors(
                 _jsonrpc_error(req_id, -32602, "Invalid params: message with text part required"),
@@ -705,9 +705,9 @@ class XuiChannel(BaseChannel):
 
         task_id = message.get("taskId") or message.get("task_id") or str(uuid.uuid4())
         context_id = message.get("contextId") or message.get("context_id") or str(uuid.uuid4())
-        sender_id = message.get("metadata", {}).get("sender_id", "xui-user")
-        chat_id = f"xui_{context_id}"
-        logger.info("XUI message/send: task_id={}, context_id={}, chat_id={}, text={}",
+        sender_id = message.get("metadata", {}).get("sender_id", "a2a-user")
+        chat_id = f"a2a_{context_id}"
+        logger.info("A2A message/send: task_id={}, context_id={}, chat_id={}, text={}",
                      task_id, context_id, chat_id, text[:60])
 
         if not self.is_allowed(sender_id):
@@ -731,8 +731,8 @@ class XuiChannel(BaseChannel):
                 sender_id=sender_id,
                 chat_id=chat_id,
                 content=text,
-                metadata={"xui": {"task_id": task_id, "context_id": context_id}},
-                session_key=f"xui:{context_id}",
+                metadata={"a2a": {"task_id": task_id, "context_id": context_id}},
+                session_key=f"a2a:{context_id}",
             )
 
             # Wait for agent reply
@@ -755,9 +755,9 @@ class XuiChannel(BaseChannel):
             )
             writer.write(resp)
             await writer.drain()
-            logger.info("XUI message/send: response written ({} bytes) for task {}", len(resp), task_id)
+            logger.info("A2A message/send: response written ({} bytes) for task {}", len(resp), task_id)
         except (ConnectionResetError, BrokenPipeError) as exc:
-            logger.warning("XUI message/send: client disconnected before response: {}", exc)
+            logger.warning("A2A message/send: client disconnected before response: {}", exc)
         finally:
             try:
                 writer.close()
@@ -780,7 +780,7 @@ class XuiChannel(BaseChannel):
         """Handle message/stream: accept message, stream SSE events."""
         message = params.get("message", {})
         text = self._extract_text(message)
-        logger.info("XUI message/stream: params keys={}, message keys={}", list(params.keys()), list(message.keys()))
+        logger.info("A2A message/stream: params keys={}, message keys={}", list(params.keys()), list(message.keys()))
         if not text:
             writer.write(_json_response_cors(
                 _jsonrpc_error(req_id, -32602, "Invalid params: message with text part required"),
@@ -792,9 +792,9 @@ class XuiChannel(BaseChannel):
 
         task_id = message.get("taskId") or message.get("task_id") or str(uuid.uuid4())
         context_id = message.get("contextId") or message.get("context_id") or str(uuid.uuid4())
-        sender_id = message.get("metadata", {}).get("sender_id", "xui-user")
-        chat_id = f"xui_{context_id}"
-        logger.info("XUI message/stream: task_id={}, context_id={}, chat_id={}, text={}",
+        sender_id = message.get("metadata", {}).get("sender_id", "a2a-user")
+        chat_id = f"a2a_{context_id}"
+        logger.info("A2A message/stream: task_id={}, context_id={}, chat_id={}, text={}",
                      task_id, context_id, chat_id, text[:60])
 
         if not self.is_allowed(sender_id):
@@ -820,7 +820,7 @@ class XuiChannel(BaseChannel):
             # Start SSE response
             writer.write(_sse_start_headers(origin, allowed))
             await writer.drain()
-            logger.info("XUI SSE: headers sent for task {}", task_id)
+            logger.info("A2A SSE: headers sent for task {}", task_id)
 
             # Send initial Task event
             task_info.state = "submitted"
@@ -828,17 +828,17 @@ class XuiChannel(BaseChannel):
                 _jsonrpc_success(req_id, task_info.to_task_dict())
             ))
             await writer.drain()
-            logger.info("XUI SSE: initial task event sent for task {}", task_id)
+            logger.info("A2A SSE: initial task event sent for task {}", task_id)
 
             # Submit to nanobot agent
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=chat_id,
                 content=text,
-                metadata={"xui": {"task_id": task_id, "context_id": context_id, "stream": True}},
-                session_key=f"xui:{context_id}",
+                metadata={"a2a": {"task_id": task_id, "context_id": context_id, "stream": True}},
+                session_key=f"a2a:{context_id}",
             )
-            logger.info("XUI SSE: message submitted to bus, waiting for events...")
+            logger.info("A2A SSE: message submitted to bus, waiting for events...")
 
             # Stream events from queue
             # Each event dict: {"state": str, "final": bool, "message": dict|None, "metadata": dict|None}
@@ -846,7 +846,7 @@ class XuiChannel(BaseChannel):
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=self.config.response_timeout)
                 except asyncio.TimeoutError:
-                    logger.warning("XUI SSE: timeout waiting for events, task {}", task_id)
+                    logger.warning("A2A SSE: timeout waiting for events, task {}", task_id)
                     writer.write(_sse_data(
                         _jsonrpc_success(req_id, {
                             "kind": "status-update",
@@ -884,14 +884,14 @@ class XuiChannel(BaseChannel):
                 sse_bytes = _sse_data(_jsonrpc_success(req_id, status_update))
                 writer.write(sse_bytes)
                 await writer.drain()
-                logger.info("XUI SSE: status-update sent state={} final={} ({} bytes) task={}",
+                logger.info("A2A SSE: status-update sent state={} final={} ({} bytes) task={}",
                             state, is_final, len(sse_bytes), task_id)
 
                 if is_final:
                     break
 
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError) as exc:
-            logger.warning("XUI SSE: client disconnected: {} (task {})", exc, task_id)
+            logger.warning("A2A SSE: client disconnected: {} (task {})", exc, task_id)
         finally:
             if queue in task_info.sse_queues:
                 task_info.sse_queues.remove(queue)
