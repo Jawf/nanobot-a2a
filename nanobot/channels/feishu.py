@@ -373,6 +373,22 @@ class FeishuChannel(BaseChannel):
         self._running = False
         logger.info("Feishu bot stopped")
 
+    async def init_for_send(self) -> None:
+        """Initialize Feishu HTTP client for outbound sending only (no WebSocket listener)."""
+        if not FEISHU_AVAILABLE:
+            logger.warning("Feishu SDK not installed. Run: pip install lark-oapi")
+            return
+        if not self.config.app_id or not self.config.app_secret:
+            logger.warning("Feishu app_id and app_secret not configured")
+            return
+        import lark_oapi as lark
+        self._client = lark.Client.builder() \
+            .app_id(self.config.app_id) \
+            .app_secret(self.config.app_secret) \
+            .log_level(lark.LogLevel.INFO) \
+            .build()
+        logger.info("Feishu HTTP client initialized for outbound sending")
+
     def _is_bot_mentioned(self, message: Any) -> bool:
         """Check if the bot is @mentioned in the message."""
         raw_content = message.content or ""
@@ -893,110 +909,105 @@ class FeishuChannel(BaseChannel):
                 ).build()
             response = self._client.im.v1.message.create(request)
             if not response.success():
-                logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
-                    msg_type, response.code, response.msg, response.get_log_id()
-                )
-                return False
+                err = f"code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+                logger.error("Failed to send Feishu {} message: {}", msg_type, err)
+                raise RuntimeError(f"Feishu API error: {err}")
             logger.debug("Feishu {} message sent to {}", msg_type, receive_id)
             return True
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
-            return False
+            raise
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
-            logger.warning("Feishu client not initialized")
+            raise RuntimeError("Feishu client not initialized — check app_id/app_secret config and lark-oapi installation")
+
+        receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
+        loop = asyncio.get_running_loop()
+
+        # Handle tool hint messages as code blocks in interactive cards.
+        # These are progress-only messages and should bypass normal reply routing.
+        if msg.metadata.get("_tool_hint"):
+            if msg.content and msg.content.strip():
+                await self._send_tool_hint_card(
+                    receive_id_type, msg.chat_id, msg.content.strip()
+                )
             return
 
-        try:
-            receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
-            loop = asyncio.get_running_loop()
+        # Determine whether the first message should quote the user's message.
+        # Only the very first send (media or text) in this call uses reply; subsequent
+        # chunks/media fall back to plain create to avoid redundant quote bubbles.
+        reply_message_id: str | None = None
+        if (
+            self.config.reply_to_message
+            and not msg.metadata.get("_progress", False)
+        ):
+            reply_message_id = msg.metadata.get("message_id") or None
 
-            # Handle tool hint messages as code blocks in interactive cards.
-            # These are progress-only messages and should bypass normal reply routing.
-            if msg.metadata.get("_tool_hint"):
-                if msg.content and msg.content.strip():
-                    await self._send_tool_hint_card(
-                        receive_id_type, msg.chat_id, msg.content.strip()
+        first_send = True  # tracks whether the reply has already been used
+
+        def _do_send(m_type: str, content: str) -> None:
+            """Send via reply (first message) or create (subsequent)."""
+            nonlocal first_send
+            if reply_message_id and first_send:
+                first_send = False
+                ok = self._reply_message_sync(reply_message_id, m_type, content)
+                if ok:
+                    return
+                # Fall back to regular send if reply fails
+            self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+
+        for file_path in msg.media:
+            if not os.path.isfile(file_path):
+                logger.warning("Media file not found: {}", file_path)
+                continue
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in self._IMAGE_EXTS:
+                key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+                if key:
+                    await loop.run_in_executor(
+                        None, _do_send,
+                        "image", json.dumps({"image_key": key}, ensure_ascii=False),
                     )
-                return
+            else:
+                key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                if key:
+                    # Use msg_type "media" for audio/video so users can play inline;
+                    # "file" for everything else (documents, archives, etc.)
+                    if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
+                        media_type = "media"
+                    else:
+                        media_type = "file"
+                    await loop.run_in_executor(
+                        None, _do_send,
+                        media_type, json.dumps({"file_key": key}, ensure_ascii=False),
+                    )
 
-            # Determine whether the first message should quote the user's message.
-            # Only the very first send (media or text) in this call uses reply; subsequent
-            # chunks/media fall back to plain create to avoid redundant quote bubbles.
-            reply_message_id: str | None = None
-            if (
-                self.config.reply_to_message
-                and not msg.metadata.get("_progress", False)
-            ):
-                reply_message_id = msg.metadata.get("message_id") or None
+        if msg.content and msg.content.strip():
+            fmt = self._detect_msg_format(msg.content)
 
-            first_send = True  # tracks whether the reply has already been used
+            if fmt == "text":
+                # Short plain text – send as simple text message
+                text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                await loop.run_in_executor(None, _do_send, "text", text_body)
 
-            def _do_send(m_type: str, content: str) -> None:
-                """Send via reply (first message) or create (subsequent)."""
-                nonlocal first_send
-                if reply_message_id and first_send:
-                    first_send = False
-                    ok = self._reply_message_sync(reply_message_id, m_type, content)
-                    if ok:
-                        return
-                    # Fall back to regular send if reply fails
-                self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+            elif fmt == "post":
+                # Medium content with links – send as rich-text post
+                post_body = self._markdown_to_post(msg.content)
+                await loop.run_in_executor(None, _do_send, "post", post_body)
 
-            for file_path in msg.media:
-                if not os.path.isfile(file_path):
-                    logger.warning("Media file not found: {}", file_path)
-                    continue
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext in self._IMAGE_EXTS:
-                    key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
-                    if key:
-                        await loop.run_in_executor(
-                            None, _do_send,
-                            "image", json.dumps({"image_key": key}, ensure_ascii=False),
-                        )
-                else:
-                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
-                    if key:
-                        # Use msg_type "media" for audio/video so users can play inline;
-                        # "file" for everything else (documents, archives, etc.)
-                        if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
-                            media_type = "media"
-                        else:
-                            media_type = "file"
-                        await loop.run_in_executor(
-                            None, _do_send,
-                            media_type, json.dumps({"file_key": key}, ensure_ascii=False),
-                        )
-
-            if msg.content and msg.content.strip():
-                fmt = self._detect_msg_format(msg.content)
-
-                if fmt == "text":
-                    # Short plain text – send as simple text message
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
-                    await loop.run_in_executor(None, _do_send, "text", text_body)
-
-                elif fmt == "post":
-                    # Medium content with links – send as rich-text post
-                    post_body = self._markdown_to_post(msg.content)
-                    await loop.run_in_executor(None, _do_send, "post", post_body)
-
-                else:
-                    # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
-                    for chunk in self._split_elements_by_table_limit(elements):
-                        card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
-                            None, _do_send,
-                            "interactive", json.dumps(card, ensure_ascii=False),
-                        )
-
-        except Exception as e:
-            logger.error("Error sending Feishu message: {}", e)
+            else:
+                # Complex / long content – send as interactive card
+                elements = self._build_card_elements(msg.content)
+                for chunk in self._split_elements_by_table_limit(elements):
+                    card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                    await loop.run_in_executor(
+                        None, _do_send,
+                        "interactive", json.dumps(card, ensure_ascii=False),
+                    )
 
     def _on_message_sync(self, data: Any) -> None:
         """

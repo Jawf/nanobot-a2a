@@ -6,6 +6,8 @@ import re
 import shutil
 from pathlib import Path
 
+from loguru import logger
+
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
@@ -178,10 +180,14 @@ class SkillsLoader:
         """Check if skill requirements are met (bins, env vars)."""
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
-            if not shutil.which(b):
+            path = shutil.which(b)
+            if not path:
+                logger.debug("Skill requirement not met: bin '{}' not found on PATH", b)
                 return False
+            logger.debug("Skill requirement met: bin '{}' -> {}", b, path)
         for env in requires.get("env", []):
             if not os.environ.get(env):
+                logger.debug("Skill requirement not met: env '{}' not set", env)
                 return False
         return True
 

@@ -150,6 +150,17 @@ class GeminiImageConfig(Base):
     timeout: int = 120  # seconds for image generation
 
 
+class TTSConfig(Base):
+    """Text-to-Speech service configuration."""
+
+    provider: str = "edge"  # "edge" (free, default) or "openai"
+    api_key: str = ""  # Required only for openai provider
+    api_base: str = ""  # Optional custom endpoint for openai provider
+    model: str = ""  # e.g. "tts-1" for openai; ignored for edge
+    voice: str = "zh-CN-XiaoxiaoNeural"  # Default voice (Edge TTS voice name)
+    timeout: int = 60  # seconds per TTS request
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -158,6 +169,7 @@ class ToolsConfig(Base):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     gemini_image: GeminiImageConfig = Field(default_factory=GeminiImageConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
 
 
 class Config(BaseSettings):

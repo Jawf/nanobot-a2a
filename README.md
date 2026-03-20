@@ -138,6 +138,18 @@ cd nanobot
 pip install -e .
 ```
 
+**Install from source with uv** (editable, picks up local code changes immediately)
+
+```bash
+uv tool install -e .
+```
+
+To reinstall/force-refresh after pulling new code (stop the gateway first):
+
+```bash
+uv tool install -e . --reinstall --force
+```
+
 **Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
 
 ```bash
@@ -1288,12 +1300,13 @@ nanobot gateway --config ~/.nanobot-telegram/config.json --workspace /tmp/nanobo
 |---------|-------------|
 | `nanobot onboard` | Initialize config & workspace at `~/.nanobot/` |
 | `nanobot onboard -c <config> -w <workspace>` | Initialize or refresh a specific instance config and workspace |
-| `nanobot agent -m "..."` | Chat with the agent |
+| `nanobot agent -m "..."` | Chat with the agent (one-shot) |
 | `nanobot agent -w <workspace>` | Chat against a specific workspace |
 | `nanobot agent -w <workspace> -c <config>` | Chat against a specific workspace/config |
 | `nanobot agent` | Interactive chat mode |
 | `nanobot agent --no-markdown` | Show plain-text replies |
 | `nanobot agent --logs` | Show runtime logs during chat |
+| `nanobot push <channel> <chat_id> "<msg>"` | Push a message directly to a channel user (no LLM) |
 | `nanobot gateway` | Start the gateway |
 | `nanobot status` | Show status |
 | `nanobot provider login openai-codex` | OAuth login for providers |
@@ -1301,6 +1314,30 @@ nanobot gateway --config ~/.nanobot-telegram/config.json --workspace /tmp/nanobo
 | `nanobot channels status` | Show channel status |
 
 Interactive mode exits: `exit`, `quit`, `/exit`, `/quit`, `:q`, or `Ctrl+D`.
+
+### Proactive Push
+
+Send messages to users without waiting for them to initiate a conversation.
+
+**Method 1 — Direct push** (instant, no LLM, recommended for scripts/cron):
+
+```bash
+# Push a message directly to a Feishu user by open_id
+nanobot push feishu ou_abc123 "Your scheduled report is ready"
+
+# Works with any enabled channel
+nanobot push telegram 123456789 "Hello from nanobot!"
+```
+
+**Method 2 — Via LLM agent** (lets the agent decide what to say):
+
+```bash
+nanobot agent -m "用飞书发消息给 open_id=ou_abc123，内容：主动推送消息hi"
+```
+
+The agent calls the `message` tool internally and the CLI delivers the message to the channel after the LLM finishes.
+
+> **Note:** The channel must be `enabled: true` in your `config.json` for push to work. The `nanobot gateway` does **not** need to be running for either method.
 
 <details>
 <summary><b>Heartbeat (Periodic Tasks)</b></summary>

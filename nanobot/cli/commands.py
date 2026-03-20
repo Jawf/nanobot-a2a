@@ -506,6 +506,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         gemini_image_config=config.tools.gemini_image,
+        tts_config=config.tools.tts,
     )
 
     # Set cron callback (needs agent)
@@ -698,6 +699,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         gemini_image_config=config.tools.gemini_image,
+        tts_config=config.tools.tts,
     )
 
     # Shared reference for progress callbacks
@@ -715,11 +717,60 @@ def agent(
         # Single message mode — direct call, no bus needed
         async def run_once():
             nonlocal _thinking
+
+            # Intercept the message tool's callback to capture outbound messages
+            # directly (bypasses relying on bus queue state).
+            from nanobot.agent.tools.message import MessageTool as _MessageTool
+            from nanobot.bus.events import OutboundMessage as _OutboundMessage
+            captured: list[_OutboundMessage] = []
+
+            async def _capture(msg: _OutboundMessage) -> None:
+                captured.append(msg)
+
+            mt = agent_loop.tools.get("message")
+            _orig_cb = None
+            if isinstance(mt, _MessageTool):
+                _orig_cb = mt._send_callback
+                mt.set_send_callback(_capture)
+
             _thinking = _ThinkingSpinner(enabled=not logs)
             with _thinking:
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
             _thinking = None
+
+            # Restore callback
+            if isinstance(mt, _MessageTool) and _orig_cb is not None:
+                mt.set_send_callback(_orig_cb)
+
             _print_agent_response(response, render_markdown=markdown)
+
+            # Deliver any messages the agent queued via the message tool
+            to_send = [m for m in captured if not m.metadata.get("_progress")]
+            if to_send:
+                try:
+                    from nanobot.channels.manager import ChannelManager
+                    ch_manager = ChannelManager(config, bus)
+                    _inited: set[str] = set()
+                    for m in to_send:
+                        ch = ch_manager.channels.get(m.channel)
+                        if not ch:
+                            console.print(f"[red]  ✗ no handler for channel '{m.channel}'[/red]")
+                            continue
+                        if m.channel not in _inited:
+                            await ch.init_for_send()
+                            _inited.add(m.channel)
+                        try:
+                            await ch.send(m)
+                            preview = (m.content or "")[:60].replace("\n", " ")
+                            console.print(f"[green]↳ Pushed to {m.channel}:{m.chat_id}[/green]")
+                            console.print(f'[dim]  "{preview}"[/dim]')
+                        except Exception as e:
+                            console.print(f"[red]  ✗ {m.channel}→{m.chat_id}: {e}[/red]")
+                except SystemExit as e:
+                    console.print(f"[red]Channel init error: {e}[/red]")
+                except Exception as e:
+                    console.print(f"[red]Failed to deliver messages: {e}[/red]")
+
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -831,6 +882,78 @@ def agent(
                 await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
+
+
+# ============================================================================
+# Push — direct message delivery, no LLM
+# ============================================================================
+
+
+@app.command()
+def push(
+    channel: str = typer.Argument(..., help="Target channel name (feishu, telegram, etc.)"),
+    to: str = typer.Argument(..., help="Recipient chat_id or user open_id"),
+    content: str = typer.Argument(..., help="Message content to send"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Push a message directly to a channel user (no LLM, instant delivery).
+
+    Example:
+
+      nanobot push feishu ou_abc123 "Hello from nanobot!"
+    """
+    import asyncio as _asyncio
+
+    config_obj = _load_runtime_config(config, None)
+
+    async def _run():
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.bus.queue import MessageBus
+        from nanobot.channels.registry import load_channel_class
+
+        # Locate channel config
+        ch_config = getattr(config_obj.channels, channel, None)
+        if ch_config is None:
+            console.print(f"[red]Error: Channel '{channel}' not in config. Run 'nanobot onboard' to add it.[/red]")
+            raise typer.Exit(1)
+        enabled = (
+            ch_config.get("enabled", False)
+            if isinstance(ch_config, dict)
+            else getattr(ch_config, "enabled", False)
+        )
+        if not enabled:
+            console.print(f"[red]Error: Channel '{channel}' is not enabled. Set enabled=true in config.[/red]")
+            raise typer.Exit(1)
+
+        # Load channel class
+        try:
+            cls = load_channel_class(channel)
+        except ImportError as e:
+            console.print(f"[red]Error: Cannot load channel '{channel}': {e}[/red]")
+            raise typer.Exit(1)
+
+        # Instantiate channel and initialize HTTP client only (no WebSocket/polling)
+        bus = MessageBus()
+        ch = cls(ch_config, bus)
+        try:
+            await ch.init_for_send()
+        except Exception as e:
+            console.print(f"[red]Error: Failed to initialize {channel} client: {e}[/red]")
+            raise typer.Exit(1)
+
+        # Send the message directly
+        msg = OutboundMessage(channel=channel, chat_id=to, content=content)
+        try:
+            await ch.send(msg)
+            preview = content[:80].replace("\n", " ")
+            console.print(f"[green]✓ Message sent[/green]  {channel}:{to}")
+            console.print(f'[dim]  "{preview}"[/dim]')
+        except Exception as e:
+            console.print(f"[red]✗ Failed to send to {channel}:{to}[/red]")
+            console.print(f"[red]  {e}[/red]")
+            raise typer.Exit(1)
+
+    _asyncio.run(_run())
 
 
 # ============================================================================

@@ -141,6 +141,61 @@ class ChannelManager:
             except asyncio.CancelledError:
                 break
 
+    async def flush_outbound(self, timeout: float = 5.0) -> tuple[int, list[str], list[str]]:
+        """Initialize channels for sending and drain all pending outbound messages.
+
+        Used by ``nanobot agent -m`` to deliver messages the agent queued via the
+        ``message`` tool without starting the full inbound (WebSocket/polling) listeners.
+
+        Returns:
+            Tuple of (success_count, error_messages, sent_descriptions).
+        """
+        # Initialize each channel's HTTP client (no WebSocket/polling started)
+        errors: list[str] = []
+        for name, ch in self.channels.items():
+            try:
+                await ch.init_for_send()
+            except Exception as e:
+                err = f"{name}: init failed — {e}"
+                logger.warning("Failed to init channel for send: {}", e)
+                errors.append(err)
+
+        count = 0
+        sent: list[str] = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                msg = await asyncio.wait_for(
+                    self.bus.consume_outbound(),
+                    timeout=min(remaining, 0.5),
+                )
+                # Skip progress/hint messages — not useful in one-shot CLI mode
+                if msg.metadata.get("_progress"):
+                    continue
+                channel = self.channels.get(msg.channel)
+                if channel:
+                    preview = (msg.content or "")[:60].replace("\n", " ")
+                    logger.info("Flushing to {}/{}: {}...", msg.channel, msg.chat_id, preview)
+                    try:
+                        await channel.send(msg)
+                        count += 1
+                        sent.append(f'{msg.channel}:{msg.chat_id} — "{preview}"')
+                    except Exception as e:
+                        err = f"{msg.channel}→{msg.chat_id}: {e}"
+                        logger.error("Error flushing message to {}: {}", msg.channel, e)
+                        errors.append(err)
+                else:
+                    err = f"no handler for channel '{msg.channel}' (message to {msg.chat_id} lost)"
+                    logger.warning("No channel handler for outbound message: {}", msg.channel)
+                    errors.append(err)
+            except asyncio.TimeoutError:
+                break
+        return count, errors, sent
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)

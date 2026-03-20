@@ -76,6 +76,14 @@ class BaseChannel(ABC):
         """
         pass
 
+    async def init_for_send(self) -> None:
+        """Initialize channel for outbound-only sending (no inbound listener/WebSocket).
+
+        Override in channels that require client initialization before send() can be called.
+        Default is a no-op for channels that self-initialize or don't need pre-init.
+        """
+        pass
+
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
         allow_list = getattr(self.config, "allow_from", [])

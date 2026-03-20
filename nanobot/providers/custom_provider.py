@@ -128,6 +128,31 @@ class CustomProvider(LLMProvider):
         # reject the request for missing thought_signature.
         clean = self._collapse_tool_rounds(clean)
 
+        # Defensive: strip non-standard fields and tool artefacts.
+        # Many Gemini gateways (ymcas-ai) choke on:
+        #   - tool_calls / tool role  (missing thought_signature)
+        #   - reasoning_content / thinking_blocks  (thinking model metadata)
+        # Keep only the standard OpenAI Chat Completion fields per role.
+        _ALLOWED_KEYS = {
+            "system":    {"role", "content", "name"},
+            "user":      {"role", "content", "name"},
+            "assistant": {"role", "content"},  # tool_calls already collapsed
+            "tool":      {"role", "content", "tool_call_id", "name"},
+        }
+        sanitized: list[dict[str, Any]] = []
+        for msg in clean:
+            role = msg.get("role", "")
+            if role == "tool":
+                continue  # orphan tool-result
+            if role == "assistant" and msg.get("tool_calls"):
+                logger.warning(
+                    "tool_calls survived collapse! Stripping from message: {}",
+                    (msg.get("content") or "")[:100],
+                )
+            allowed = _ALLOWED_KEYS.get(role, {"role", "content"})
+            sanitized.append({k: v for k, v in msg.items() if k in allowed})
+        clean = sanitized
+
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": clean,
@@ -141,7 +166,9 @@ class CustomProvider(LLMProvider):
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
-            return LLMResponse(content=f"Error: {e}", finish_reason="error")
+            err_msg = str(e)
+            logger.error("Custom provider API error (model={}):\n{}", kwargs.get("model"), err_msg)
+            return LLMResponse(content=f"Error: {err_msg}", finish_reason="error")
 
     # ------------------------------------------------------------------
     # Response parsing

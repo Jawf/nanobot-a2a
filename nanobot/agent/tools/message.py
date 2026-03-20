@@ -55,7 +55,7 @@ class MessageTool(Tool):
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Optional: target channel (telegram, discord, etc.)"
+                    "description": "Optional: target channel name (feishu, telegram, discord, slack, etc.). Required when sending to a channel other than the current one."
                 },
                 "chat_id": {
                     "type": "string",

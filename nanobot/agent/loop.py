@@ -65,6 +65,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         gemini_image_config: Any | None = None,
+        tts_config: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -80,6 +81,15 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+
+        # Apply pathAppend to the process PATH so shutil.which() and
+        # subprocess calls (e.g. ffmpeg) can find extra binaries.
+        if self.exec_config.path_append:
+            current = os.environ.get("PATH", "")
+            extra = self.exec_config.path_append
+            if extra not in current:
+                os.environ["PATH"] = current + os.pathsep + extra
+                logger.info("PATH extended with: {}", extra)
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -97,6 +107,7 @@ class AgentLoop:
 
         self._running = False
         self._gemini_image_config = gemini_image_config
+        self._tts_config = tts_config
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -155,6 +166,71 @@ class AgentLoop:
             gemini_service=gemini_svc, script_tool=script_tool,
             send_callback=self.bus.publish_outbound,
         ))
+        # Comic storyboard tools (4-phase: script → images → TTS → video)
+        import shutil as _shutil
+        _ffmpeg_path = _shutil.which("ffmpeg")
+        if not _ffmpeg_path:
+            logger.warning(
+                "ffmpeg NOT found on PATH — comic video composition (Phase 4) "
+                "will fail. Install ffmpeg or set tools.exec.pathAppend in config."
+            )
+        if not gemini_svc:
+            logger.warning(
+                "Gemini image service NOT configured — comic image generation "
+                "(Phase 2) will be unavailable. Set tools.geminiImage.apiKey in config."
+            )
+        logger.info("Comic tools init: ffmpeg={}, gemini_svc={}, tts_config={}",
+                     _ffmpeg_path, gemini_svc is not None,
+                     getattr(self._tts_config, "voice", None))
+        from nanobot.agent.tools.comic_storyboard import (
+            ComicStoryboardScriptTool,
+            ComicStoryboardImagesTool,
+            ComicStoryboardTTSTool,
+            ComicStoryboardVideoTool,
+        )
+        comic_script_tool = ComicStoryboardScriptTool(
+            provider=self.provider, model=self.model,
+            send_callback=self.bus.publish_outbound,
+        )
+        self.tools.register(comic_script_tool)
+        comic_images_tool = ComicStoryboardImagesTool(
+            provider=self.provider, model=self.model,
+            gemini_service=gemini_svc, script_tool=comic_script_tool,
+            send_callback=self.bus.publish_outbound,
+        )
+        self.tools.register(comic_images_tool)
+        tts_svc = None
+        if self._tts_config and getattr(self._tts_config, "voice", ""):
+            from nanobot.services.tts import TTSService
+            tts_svc = TTSService(
+                provider=self._tts_config.provider,
+                api_key=self._tts_config.api_key,
+                api_base=self._tts_config.api_base,
+                model=self._tts_config.model,
+                voice=self._tts_config.voice,
+                timeout=self._tts_config.timeout,
+                output_dir=self.workspace / "comic_assets" / "tts",
+            )
+            logger.info("TTS service initialized: provider={}, voice={}",
+                         tts_svc.provider, tts_svc.voice)
+        else:
+            logger.warning("TTS service NOT initialized (tts_config={}, voice={})",
+                           self._tts_config is not None,
+                           getattr(self._tts_config, "voice", "N/A"))
+        comic_tts_tool = ComicStoryboardTTSTool(
+            tts_service=tts_svc, script_tool=comic_script_tool,
+            send_callback=self.bus.publish_outbound,
+        )
+        self.tools.register(comic_tts_tool)
+        self.tools.register(ComicStoryboardVideoTool(
+            script_tool=comic_script_tool,
+            images_tool=comic_images_tool,
+            tts_tool=comic_tts_tool,
+            send_callback=self.bus.publish_outbound,
+            output_dir=self.workspace / "comic_assets" / "video",
+        ))
+        logger.info("Comic tools registered: script, images, tts, video (total tools={})",
+                     len(list(self.tools.tool_names)))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -261,7 +337,7 @@ class AgentLoop:
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", clean or "")
+                    logger.error("LLM returned error:\n{}", clean or "(empty)")
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
@@ -475,7 +551,8 @@ class AgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
-        preview = final_content[:500] + "..." if len(final_content) > 500 else final_content
+        max_preview = 2000 if final_content.startswith("Error") else 500
+        preview = final_content[:max_preview] + "..." if len(final_content) > max_preview else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
