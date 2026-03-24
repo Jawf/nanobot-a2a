@@ -18,6 +18,7 @@ from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.tools.claude_cli import ClaudeCliTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -145,6 +146,8 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        # Claude CLI tool
+        self.tools.register(ClaudeCliTool(send_callback=self.bus.publish_outbound))
         # PPT storyboard tools
         from nanobot.agent.tools.ppt_storyboard import PptStoryboardScriptTool, PptStoryboardAssetsTool
         script_tool = PptStoryboardScriptTool(
