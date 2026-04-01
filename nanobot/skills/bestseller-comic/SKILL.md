@@ -1,7 +1,7 @@
 ---
 name: bestseller-comic
 description: "将小说转化为爆款动态漫画：接收小说大纲/角色/章节文字（可来自 bestseller-novel 技能），产出分镜脚本，生成漫画面板图片，合成TTS语音，最终输出每集MP4视频。含专业分镜能力与平台爆款规则。"
-metadata: {"nanobot":{"emoji":"🎬","requires":{"bins":["ffmpeg"]},"always":false}}
+metadata: {"nanobot":{"emoji":"🎬","requires":{"bins":["ffmpeg"]},"always":true}}
 ---
 
 # 小说→爆款动态漫画 Skill
@@ -32,6 +32,15 @@ metadata: {"nanobot":{"emoji":"🎬","requires":{"bins":["ffmpeg"]},"always":fal
 ### 1.2 如何从 bestseller-novel 获取输入
 
 如果用户已使用 bestseller-novel 技能产出小说内容，直接将该输出（或其关键部分：大纲、角色、前几章正文）作为 `novel_text` 传入第一阶段工具。无需用户手动复制——agent 可从对话历史中提取。
+
+---
+
+## ⚠️ 关键约束（必须遵守）
+
+- **严禁使用 `exec` 工具**来生成图片、音频或视频。所有媒体资产的生成**必须且只能**通过下方四个专用工具完成：`comic_storyboard_script`、`comic_storyboard_images`、`comic_storyboard_tts`、`comic_storyboard_video`。
+- **严禁编写自定义 Python/PowerShell 脚本**来调用图片生成 API、TTS 服务或 ffmpeg。这些操作已内置在专用工具中。
+- **严禁编造工具返回结果**。只能向用户报告工具实际返回的信息（文件路径、成功/失败数量等），不得虚构进度百分比、文件大小或时长。
+- **严格按四阶段顺序执行**：Phase 1 → Phase 2 → Phase 3 → Phase 4，每个阶段必须调用对应的专用工具，不可跳过或替代。
 
 ---
 

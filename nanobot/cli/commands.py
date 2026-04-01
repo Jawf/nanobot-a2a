@@ -471,6 +471,8 @@ def gateway(
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.session.manager import SessionManager
 
+    from loguru import logger
+
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
@@ -478,6 +480,19 @@ def gateway(
     config = _load_runtime_config(config, workspace)
     _print_deprecated_memory_window_notice(config)
     port = port if port is not None else config.gateway.port
+
+    # Enable loguru logging for nanobot modules and add file sink
+    logger.enable("nanobot")
+    log_dir = config.workspace_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        str(log_dir / "nanobot_{time:YYYY-MM-DD}.log"),
+        rotation="00:00",
+        retention="7 days",
+        encoding="utf-8",
+        level="DEBUG" if verbose else "INFO",
+        filter="nanobot",
+    )
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
@@ -683,6 +698,18 @@ def agent(
         logger.enable("nanobot")
     else:
         logger.disable("nanobot")
+
+    # Always write file logs regardless of --logs flag
+    log_dir = config.workspace_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        str(log_dir / "nanobot_{time:YYYY-MM-DD}.log"),
+        rotation="00:00",
+        retention="7 days",
+        encoding="utf-8",
+        level="DEBUG" if logs else "INFO",
+        filter="nanobot",
+    )
 
     agent_loop = AgentLoop(
         bus=bus,

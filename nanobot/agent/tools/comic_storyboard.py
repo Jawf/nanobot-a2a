@@ -17,6 +17,7 @@ import base64
 import json
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -31,6 +32,43 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.services.gemini_image import GeminiImageService
     from nanobot.services.tts import TTSService
+
+
+# ---------------------------------------------------------------------------
+# Session persistence helpers — survive process restarts between phases
+# ---------------------------------------------------------------------------
+
+_SESSIONS_SUBDIR = ".sessions"
+
+
+def _safe_chat_id(chat_id: str) -> str:
+    """Sanitize chat_id for use as a filesystem directory name."""
+    return chat_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+
+
+def _save_session_data(base: Path, chat_id: str, name: str, data: dict) -> None:
+    """Persist session data to disk under ``base/.sessions/{chat_id}/{name}.json``."""
+    d = base / _SESSIONS_SUBDIR / _safe_chat_id(chat_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_session_data(base: Path, chat_id: str, name: str) -> dict | None:
+    """Load session data from disk; returns *None* if missing or corrupt."""
+    f = base / _SESSIONS_SUBDIR / _safe_chat_id(chat_id) / f"{name}.json"
+    if f.is_file():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def _clear_session_data(base: Path, chat_id: str) -> None:
+    """Remove all persisted session files for *chat_id*."""
+    d = base / _SESSIONS_SUBDIR / _safe_chat_id(chat_id)
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +198,12 @@ class ComicStoryboardScriptTool(Tool):
         provider: LLMProvider,
         model: str,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        sessions_base: Path | None = None,
     ):
         self._provider = provider
         self._model = model
         self._send_callback = send_callback
+        self._sessions_base = sessions_base
         self._channel = ""
         self._chat_id = ""
         self._session_scripts: dict[str, dict] = {}
@@ -173,8 +213,17 @@ class ComicStoryboardScriptTool(Tool):
         self._chat_id = chat_id
 
     def get_script(self, chat_id: str) -> dict | None:
-        """Retrieve stored script for *chat_id* (used by subsequent phase tools)."""
-        return self._session_scripts.get(chat_id)
+        """Retrieve stored script for *chat_id* (used by subsequent phase tools).
+
+        Checks in-memory cache first, then falls back to disk.
+        """
+        data = self._session_scripts.get(chat_id)
+        if data is None and self._sessions_base:
+            data = _load_session_data(self._sessions_base, chat_id, "script")
+            if data is not None:
+                self._session_scripts[chat_id] = data
+                logger.info("Comic script restored from disk for chat_id={}", chat_id)
+        return data
 
     @property
     def name(self) -> str:
@@ -228,6 +277,26 @@ class ComicStoryboardScriptTool(Tool):
         style: str = "国漫写实",
         **kwargs: Any,
     ) -> str:
+        # Notify user immediately — script generation can take 1-3 minutes
+        if self._send_callback and self._channel:
+            ep_hint = f"，目标 {num_episodes} 集" if num_episodes else ""
+            await self._send_callback(OutboundMessage(
+                channel=self._channel,
+                chat_id=self._chat_id,
+                content=f"🎬 正在生成动漫分镜脚本{ep_hint}，预计需要 1-3 分钟，请稍候…",
+                metadata={"_progress": True},
+            ))
+
+        # Cap input length to prevent excessive token usage / provider timeouts.
+        # ~6000 chars ≈ 3000 Chinese chars ≈ 2-3 chapters, enough for 3-5 episodes.
+        _MAX_NOVEL_CHARS = 6000
+        if len(novel_text) > _MAX_NOVEL_CHARS:
+            logger.info(
+                "Novel text truncated from {} to {} chars for comic script generation",
+                len(novel_text), _MAX_NOVEL_CHARS,
+            )
+            novel_text = novel_text[:_MAX_NOVEL_CHARS] + "\n\n[...（内容已截断，请根据以上内容生成脚本）]"
+
         parts = [f"目标平台：{platform}", f"画面比例：{aspect_ratio}", f"画风：{style}"]
         if num_episodes:
             parts.append(f"目标集数：{num_episodes}")
@@ -251,14 +320,21 @@ class ComicStoryboardScriptTool(Tool):
 
         script_data = _parse_json(raw)
 
-        # Store for subsequent phases
+        # Store for subsequent phases (memory + disk)
         self._session_scripts[self._chat_id] = script_data
+        if self._sessions_base:
+            _save_session_data(self._sessions_base, self._chat_id, "script", script_data)
+            logger.info(
+                "Comic script session saved to disk: {}",
+                self._sessions_base / _SESSIONS_SUBDIR / _safe_chat_id(self._chat_id) / "script.json",
+            )
 
         episodes = script_data.get("episodes", [])
         total_panels = sum(len(ep.get("panels", [])) for ep in episodes)
+        characters = [c.get("name", "?") for c in script_data.get("characters", [])]
         logger.info(
-            "Comic script generated: {} episodes, {} panels for chat_id={}",
-            len(episodes), total_panels, self._chat_id,
+            "Comic script generated: {} episodes, {} panels, characters={} for chat_id={}",
+            len(episodes), total_panels, characters, self._chat_id,
         )
 
         # Send XUI data messages per episode
@@ -305,6 +381,7 @@ class ComicStoryboardImagesTool(Tool):
         gemini_service: GeminiImageService | None,
         script_tool: ComicStoryboardScriptTool,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        output_dir: Path | None = None,
     ):
         self._provider = provider
         self._model = model
@@ -313,15 +390,37 @@ class ComicStoryboardImagesTool(Tool):
         self._send_callback = send_callback
         self._channel = ""
         self._chat_id = ""
-        self._session_images: dict[str, dict[str, str]] = {}  # chat_id -> {panel_id: image_url}
+        self._session_images: dict[str, dict[str, str]] = {}  # chat_id -> {panel_id: local_path}
+        if output_dir is None:
+            fallback = Path(tempfile.gettempdir()) / "nanobot_comic_images"
+            logger.warning(
+                "ComicStoryboardImagesTool: output_dir not set; images will go to system temp: {}. "
+                "Pass output_dir=workspace/comic_assets/images when registering.",
+                fallback,
+            )
+            self._output_dir = fallback
+            self._sessions_base: Path | None = None
+        else:
+            self._output_dir = output_dir
+            self._sessions_base = output_dir.parent  # workspace/comic_assets
+        self._output_dir.mkdir(parents=True, exist_ok=True)
 
     def set_context(self, channel: str, chat_id: str) -> None:
         self._channel = channel
         self._chat_id = chat_id
 
     def get_images(self, chat_id: str) -> dict[str, str] | None:
-        """Retrieve stored images for *chat_id*."""
-        return self._session_images.get(chat_id)
+        """Retrieve stored images for *chat_id*.
+
+        Checks in-memory cache first, then falls back to disk.
+        """
+        data = self._session_images.get(chat_id)
+        if data is None and self._sessions_base:
+            data = _load_session_data(self._sessions_base, chat_id, "images")
+            if data is not None:
+                self._session_images[chat_id] = data
+                logger.info("Comic images restored from disk for chat_id={}", chat_id)
+        return data
 
     @property
     def name(self) -> str:
@@ -358,16 +457,32 @@ class ComicStoryboardImagesTool(Tool):
         episode_filter: str = "",
         **kwargs: Any,
     ) -> str:
+        logger.info(
+            "[Images] Phase 2 started: chat_id={}, output_dir={}, episode_filter={}",
+            self._chat_id, self._output_dir, episode_filter or "(all)",
+        )
         script_data = self._script_tool.get_script(self._chat_id)
         if not script_data:
+            logger.warning("[Images] No script found for chat_id={}", self._chat_id)
             return "错误：未找到已生成的分镜脚本。请先调用 comic_storyboard_script 生成脚本。"
 
         if not self._gemini:
+            logger.warning("[Images] Gemini service not configured")
             return "错误：Gemini 图片生成服务未配置。请在 config.json 中配置 tools.gemini_image。"
 
         episodes = script_data.get("episodes", [])
         aspect_ratio = script_data.get("aspect_ratio", "9:16")
         images: dict[str, str] = self._session_images.get(self._chat_id, {})
+
+        total_panels = sum(len(ep.get("panels", [])) for ep in episodes)
+        ep_label = f"第 {episode_filter} 集" if episode_filter else f"全部 {len(episodes)} 集"
+        if self._send_callback and self._channel:
+            await self._send_callback(OutboundMessage(
+                channel=self._channel,
+                chat_id=self._chat_id,
+                content=f"🖼 开始生成漫画面板图片（{ep_label}，共 {total_panels} 张），每张约 5-15 秒…",
+                metadata={"_progress": True},
+            ))
 
         # Build a global prompt suffix for style/character consistency
         prompt_suffix = _build_prompt_suffix(script_data)
@@ -411,10 +526,18 @@ class ComicStoryboardImagesTool(Tool):
                             await asyncio.sleep(1)
 
                 if image_url:
-                    images[panel_id] = image_url
+                    # Save image to disk immediately to avoid URL expiration during Phase 4.
+                    ep_dir = self._output_dir / ep_id
+                    ep_dir.mkdir(parents=True, exist_ok=True)
+                    img_dest = ep_dir / panel_id
+                    try:
+                        local_path = await _download_image(image_url, img_dest)
+                        images[panel_id] = str(local_path)
+                        logger.info("Comic image saved for {}: {}", panel_id, local_path)
+                    except Exception as save_err:
+                        logger.warning("Comic image save failed for {}, storing URL: {}", panel_id, save_err)
+                        images[panel_id] = image_url
                     ok_count += 1
-                    logger.info("Comic image generated for {}: {}",
-                                panel_id, (image_url or "")[:80])
                 else:
                     fail_count += 1
                     logger.warning("Comic image generation failed for {}: {}", panel_id, last_err)
@@ -424,7 +547,7 @@ class ComicStoryboardImagesTool(Tool):
                     panel_result = {
                         "panelId": panel_id,
                         "episodeId": ep_id,
-                        "imageUrl": images.get(panel_id, ""),
+                        "imageUrl": image_url or "",  # XUI uses original URL for display
                         "imagePrompt": image_prompt,
                     }
                     params = {
@@ -451,6 +574,19 @@ class ComicStoryboardImagesTool(Tool):
                     ))
 
         self._session_images[self._chat_id] = images
+        if self._sessions_base:
+            _save_session_data(self._sessions_base, self._chat_id, "images", images)
+
+        # Notify user when ALL images failed
+        if ok_count == 0 and fail_count > 0 and self._send_callback and self._channel:
+            await self._send_callback(OutboundMessage(
+                channel=self._channel,
+                chat_id=self._chat_id,
+                content=(
+                    f"⚠️ 漫画图片生成全部失败（共 {fail_count} 张）。"
+                    "可能原因：图片生成服务暂时不可用，请稍后重试或检查 Gemini 配置。"
+                ),
+            ))
 
         summary = f"漫画面板图片生成完成：成功 {ok_count} 张，失败 {fail_count} 张。\n"
         for ep in episodes:
@@ -463,6 +599,7 @@ class ComicStoryboardImagesTool(Tool):
                 status = "✓" if pid in images and images[pid] else "✗"
                 summary += f"  {status} {pid} ({panel.get('shot_type', '')})\n"
 
+        summary += f"\n图片保存目录：{self._output_dir}"
         return summary
 
 
@@ -479,10 +616,12 @@ class ComicStoryboardTTSTool(Tool):
         tts_service: TTSService | None,
         script_tool: ComicStoryboardScriptTool,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        sessions_base: Path | None = None,
     ):
         self._tts = tts_service
         self._script_tool = script_tool
         self._send_callback = send_callback
+        self._sessions_base = sessions_base
         self._channel = ""
         self._chat_id = ""
         self._session_audio: dict[str, dict[str, str]] = {}  # chat_id -> {panel_id: audio_path}
@@ -492,8 +631,17 @@ class ComicStoryboardTTSTool(Tool):
         self._chat_id = chat_id
 
     def get_audio(self, chat_id: str) -> dict[str, str] | None:
-        """Retrieve stored audio paths for *chat_id*."""
-        return self._session_audio.get(chat_id)
+        """Retrieve stored audio paths for *chat_id*.
+
+        Checks in-memory cache first, then falls back to disk.
+        """
+        data = self._session_audio.get(chat_id)
+        if data is None and self._sessions_base:
+            data = _load_session_data(self._sessions_base, chat_id, "audio")
+            if data is not None:
+                self._session_audio[chat_id] = data
+                logger.info("Comic audio restored from disk for chat_id={}", chat_id)
+        return data
 
     @property
     def name(self) -> str:
@@ -530,11 +678,17 @@ class ComicStoryboardTTSTool(Tool):
         voice: str = "",
         **kwargs: Any,
     ) -> str:
+        logger.info(
+            "[TTS] Phase 3 started: chat_id={}, output_dir={}, episode_filter={}",
+            self._chat_id, getattr(self._tts, "output_dir", "N/A"), episode_filter or "(all)",
+        )
         script_data = self._script_tool.get_script(self._chat_id)
         if not script_data:
+            logger.warning("[TTS] No script found for chat_id={}", self._chat_id)
             return "错误：未找到已生成的分镜脚本。请先调用 comic_storyboard_script 生成脚本。"
 
         if not self._tts:
+            logger.warning("[TTS] TTS service not configured")
             return "错误：TTS 服务未配置。请在 config.json 中配置 tools.tts。"
 
         episodes = script_data.get("episodes", [])
@@ -561,10 +715,11 @@ class ComicStoryboardTTSTool(Tool):
                 narration = panel.get("narration", "")
                 dialogue = panel.get("dialogue", "")
 
-                # Detect speaker from dialogue for voice selection
+                # Detect speaker + emotion from dialogue for voice/param selection
                 speaker = ""
+                emotion = ""
                 if dialogue:
-                    speaker, clean_dialogue = _detect_speaker(dialogue)
+                    speaker, emotion, clean_dialogue = _detect_speaker_emotion(dialogue)
                     if clean_dialogue:
                         tts_parts.append(clean_dialogue)
                 if narration:
@@ -579,18 +734,35 @@ class ComicStoryboardTTSTool(Tool):
 
                 # Select voice: explicit override > voice_map by speaker > default
                 panel_voice = voice or voice_map.get(speaker) or None
-                logger.debug("TTS {}: speaker={}, voice={}", panel_id, speaker, panel_voice)
+
+                # Resolve emotion: explicit tag > infer from speaker+text > None
+                if speaker == "旁白":
+                    resolved_emotion = None
+                elif emotion:
+                    resolved_emotion = emotion
+                else:
+                    resolved_emotion = _infer_emotion(speaker, tts_text)
+
+                logger.debug("TTS {}: speaker={}, emotion={}->{}, voice={}",
+                             panel_id, speaker, emotion or "(none)", resolved_emotion, panel_voice)
 
                 try:
                     audio_path = await self._tts.synthesize(
                         text=tts_text,
                         filename=panel_id,
                         voice=panel_voice,
+                        emotion=resolved_emotion,
                     )
                     audio_map[panel_id] = audio_path
                     ok_count += 1
-                    logger.info("Comic TTS generated for {}: {} (speaker={}, voice={})",
-                                panel_id, audio_path, speaker, panel_voice)
+
+                    # Update panel duration to match actual audio length + breathing room
+                    audio_dur = await _get_audio_duration(audio_path)
+                    if audio_dur > 0:
+                        panel["duration_s"] = round(max(audio_dur + 0.8, 2.5), 1)
+
+                    logger.info("Comic TTS generated for {}: {} (speaker={}, emotion={}, dur={:.1f}s)",
+                                panel_id, audio_path, speaker, resolved_emotion, panel.get("duration_s", 0))
                 except Exception as e:
                     fail_count += 1
                     logger.warning("Comic TTS failed for {}: {}", panel_id, e)
@@ -621,6 +793,8 @@ class ComicStoryboardTTSTool(Tool):
                 ))
 
         self._session_audio[self._chat_id] = audio_map
+        if self._sessions_base:
+            _save_session_data(self._sessions_base, self._chat_id, "audio", audio_map)
 
         return (
             f"TTS语音生成完成：成功 {ok_count} 个面板，失败 {fail_count} 个，"
@@ -651,7 +825,17 @@ class ComicStoryboardVideoTool(Tool):
         self._send_callback = send_callback
         self._channel = ""
         self._chat_id = ""
-        self._output_dir = output_dir or Path(tempfile.gettempdir()) / "nanobot_comic_video"
+        if output_dir is None:
+            # Fallback only — callers should always pass the workspace-relative output_dir.
+            fallback = Path(tempfile.gettempdir()) / "nanobot_comic_video"
+            logger.warning(
+                "ComicStoryboardVideoTool: output_dir not set; files will go to system temp: {}. "
+                "Pass output_dir=workspace/comic_assets/video when registering the tool.",
+                fallback,
+            )
+            self._output_dir = fallback
+        else:
+            self._output_dir = output_dir
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
     def set_context(self, channel: str, chat_id: str) -> None:
@@ -684,15 +868,22 @@ class ComicStoryboardVideoTool(Tool):
         }
 
     async def execute(self, episode_filter: str = "", **kwargs: Any) -> str:
+        logger.info(
+            "[Video] Phase 4 started: chat_id={}, output_dir={}, episode_filter={}",
+            self._chat_id, self._output_dir, episode_filter or "(all)",
+        )
         script_data = self._script_tool.get_script(self._chat_id)
         if not script_data:
+            logger.warning("[Video] No script found for chat_id={}", self._chat_id)
             return "错误：未找到分镜脚本。请先完成前三个阶段。"
 
         images = self._images_tool.get_images(self._chat_id)
         if not images:
+            logger.warning("[Video] No images found for chat_id={}", self._chat_id)
             return "错误：未找到面板图片。请先调用 comic_storyboard_images。"
 
         audio_map = self._tts_tool.get_audio(self._chat_id) or {}
+        logger.info("[Video] Resources: {} images, {} audio clips", len(images), len(audio_map))
 
         episodes = script_data.get("episodes", [])
         aspect_ratio = script_data.get("aspect_ratio", "9:16")
@@ -720,7 +911,7 @@ class ComicStoryboardVideoTool(Tool):
                 logger.info("Comic video composed for {}: {}", ep_id, video_path)
             except Exception as e:
                 results.append({"episode_id": ep_id, "error": str(e), "success": False})
-                logger.warning("Comic video composition failed for {}: {}", ep_id, e)
+                logger.exception("[Video] Composition failed for {}", ep_id)
 
             # Send XUI progress per episode
             if self._send_callback and self._channel:
@@ -742,12 +933,26 @@ class ComicStoryboardVideoTool(Tool):
                     metadata={"_progress": True, "_data_message": True, "_biz_data": biz_data},
                 ))
 
+            # Push the actual video file to the chat channel so the user can watch it.
+            # This is done as a normal (non-progress) message so it is always delivered.
+            if self._send_callback and self._channel and results[-1].get("success"):
+                await self._send_callback(OutboundMessage(
+                    channel=self._channel,
+                    chat_id=self._chat_id,
+                    content=f"🎬 {ep_id} 视频已生成",
+                    media=[results[-1]["video_path"]],
+                ))
+
         # Clean up session caches when all episodes are done (not filtered)
         if not episode_filter:
             self._script_tool._session_scripts.pop(self._chat_id, None)
             self._images_tool._session_images.pop(self._chat_id, None)
             self._tts_tool._session_audio.pop(self._chat_id, None)
-            logger.debug("Session caches cleaned for chat_id={}", self._chat_id)
+            # Also clear persisted session files on disk
+            sessions_base = getattr(self._script_tool, "_sessions_base", None)
+            if sessions_base:
+                _clear_session_data(sessions_base, self._chat_id)
+            logger.debug("Session caches cleaned (memory + disk) for chat_id={}", self._chat_id)
 
         # Summary
         ok = sum(1 for r in results if r["success"])
@@ -955,23 +1160,102 @@ def _detect_speaker(dialogue: str) -> tuple[str, str]:
 
     Returns (speaker, text) where speaker may be empty if not detected.
     """
+    speaker, _, text = _detect_speaker_emotion(dialogue)
+    return speaker, text
+
+
+def _detect_speaker_emotion(dialogue: str) -> tuple[str, str, str]:
+    """Parse a dialogue line to extract (speaker_name, emotion, clean_text).
+
+    Handles formats like:
+      ``林夜(冰冷)：台词``   → ("林夜", "冰冷", "台词")
+      ``旁白(低沉)：台词``   → ("旁白", "低沉", "台词")
+      ``楚天阔：台词``       → ("楚天阔", "", "台词")
+
+    Returns (speaker, emotion, text).
+    """
     import re
 
-    # Match: optional speaker name (Chinese/English), optional parenthesised modifier,
-    # followed by full-width or half-width colon.
     m = re.match(
-        r"^([^：:（(]{1,15})(?:[（(][^）)]*[）)])?[：:](.*)$",
+        r"^([^：:（(]{1,15})(?:[（(]([^）)]*)[）)])?[：:](.*)$",
         dialogue.strip(),
         re.DOTALL,
     )
     if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return "", dialogue.strip()
+        return m.group(1).strip(), (m.group(2) or "").strip(), m.group(3).strip()
+    return "", "", dialogue.strip()
+
+
+def _infer_emotion(speaker: str, text: str) -> str | None:
+    """Infer TTS emotion from speaker role + text content when no explicit tag.
+
+    Used as a fallback when the dialogue has no emotion annotation.
+    Returns an emotion key matching _EMOTION_PROSODY in tts.py, or None for default.
+    """
+    has_exclaim = "！" in text or "!" in text
+    has_hesitation = "……" in text or "…" in text
+    has_question = "？" in text or "?" in text
+    has_dash = "——" in text
+
+    if speaker in ("林夜",):
+        # Protagonist is cold and composed; exclamations still stay flat/icy
+        if has_exclaim and not has_hesitation:
+            return "冰冷"
+        if has_hesitation:
+            return "低沉"
+        return "平静"
+
+    elif speaker in ("楚天阔",):
+        # Main antagonist: arrogant by default, fearful when hesitant
+        if has_hesitation or has_dash:
+            return "惊恐"
+        if has_exclaim:
+            return "嚣张"
+        return "嚣张"
+
+    elif speaker in ("黑衣人队长", "黑衣人"):
+        return "强硬"
+
+    elif speaker in ("柳如烟",):
+        if has_exclaim and has_hesitation:
+            return "哭泣"
+        if has_question:
+            return "惊恐"
+        return "悲伤"
+
+    elif speaker in ("系统音",):
+        return "机械"
+
+    elif speaker in ("梁天成",):
+        if has_hesitation:
+            return "强硬"
+        if has_exclaim:
+            return "嚣张"
+        return "轻蔑"
+
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _get_audio_duration(path: str) -> float:
+    """Return audio duration in seconds via ffprobe. Returns 0.0 on failure."""
+    import asyncio
+    import json as _json
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        data = _json.loads(stdout)
+        return float(data["streams"][0]["duration"])
+    except Exception:
+        return 0.0
 
 
 def _parse_json(text: str) -> dict:
@@ -1007,27 +1291,51 @@ def _parse_json(text: str) -> dict:
     return {"raw": text}
 
 
+def _file_size_str(p: Path) -> str:
+    """Human-readable file size, e.g. '1.2 MB'."""
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return "??"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 async def _download_image(url: str, dest: Path) -> Path:
-    """Download an image URL (or decode base64 data-URL) to a local file."""
+    """Download an image URL (or decode base64 data-URL) to a local file.
+
+    Also handles local file paths: if *url* points to an existing file on disk,
+    the file is copied to *dest* (with the original extension preserved).
+    """
     if url.startswith("data:image"):
         # data:image/png;base64,xxxx
         header, b64data = url.split(",", 1)
-        ext = "png"
-        if "jpeg" in header or "jpg" in header:
-            ext = "jpg"
+        ext = "jpg" if ("jpeg" in header or "jpg" in header) else "png"
         out = dest.with_suffix(f".{ext}")
         out.write_bytes(base64.b64decode(b64data))
         return out
-    else:
-        import httpx
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "image/png")
-            ext = "jpg" if "jpeg" in content_type else "png"
-            out = dest.with_suffix(f".{ext}")
-            out.write_bytes(resp.content)
-            return out
+
+    # Check if this is already a local file path (saved in Phase 2)
+    src_path = Path(url)
+    if src_path.is_file():
+        ext = src_path.suffix or ".png"
+        out = dest.with_suffix(ext)
+        shutil.copy2(src_path, out)
+        return out
+
+    # HTTP/HTTPS URL — download it
+    import httpx
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "image/png")
+        ext = "jpg" if "jpeg" in content_type else "png"
+        out = dest.with_suffix(f".{ext}")
+        out.write_bytes(resp.content)
+        return out
 
 
 def _check_ffmpeg() -> None:
@@ -1059,18 +1367,21 @@ async def _compose_episode_video(
     """
     _check_ffmpeg()
 
-    work_dir = Path(tempfile.mkdtemp(prefix=f"comic_{episode_id}_"))
+    # Place the working directory inside the workspace (sibling of output_dir)
+    # so that all intermediate files stay within the nanobot workspace.
+    work_dir = output_dir.parent / "work" / f"comic_{episode_id}_{uuid.uuid4().hex[:8]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         return await _compose_episode_video_inner(
             episode_id, panels, images, audio_map, output_dir, aspect_ratio, work_dir,
         )
     finally:
-        # Clean up temp directory
+        # Clean up intermediate working directory after video is written
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
-            logger.debug("Failed to clean up temp dir: {}", work_dir)
+            logger.debug("Failed to clean up work dir: {}", work_dir)
 
 
 async def _compose_episode_video_inner(
@@ -1111,8 +1422,9 @@ async def _compose_episode_video_inner(
         img_dest = work_dir / f"{panel_id}"
         try:
             img_path = await _download_image(image_url, img_dest)
+            logger.info("[Video] Image ready for {}: {} ({})", panel_id, img_path, _file_size_str(img_path))
         except Exception as e:
-            logger.warning("Failed to download image for {}: {}", panel_id, e)
+            logger.warning("[Video] Failed to download image for {}: {}", panel_id, e)
             continue
 
         audio_path = audio_map.get(panel_id, "")
@@ -1128,6 +1440,7 @@ async def _compose_episode_video_inner(
 
     if not panel_entries:
         raise ValueError(f"No valid panels with images found for {episode_id}")
+    logger.info("[Video] {} panels ready for composition ({})", len(panel_entries), episode_id)
 
     # Step 2: Create concat file for images
     concat_file = work_dir / "panels.txt"
@@ -1140,9 +1453,14 @@ async def _compose_episode_video_inner(
     last_img = panel_entries[-1]["image_path"].replace("\\", "/").replace("'", "'\\''")
     lines.append(f"file '{last_img}'")
     concat_file.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("[Video] Concat file written: {}", concat_file)
 
     # Step 2.5: Generate ASS subtitle file from dialogue/narration
     ass_file = _generate_ass_subtitles(panel_entries, work_dir / "subtitles.ass", width, height)
+    if ass_file:
+        logger.info("[Video] ASS subtitles: {} ({})", ass_file, _file_size_str(ass_file))
+    else:
+        logger.info("[Video] No dialogue subtitles to burn in")
 
     # Step 3: Create slideshow video (with burned-in subtitles)
     slideshow_path = work_dir / "slideshow.mp4"
@@ -1162,6 +1480,7 @@ async def _compose_episode_video_inner(
         str(slideshow_path),
     ]
 
+    logger.info("[Video] Running ffmpeg slideshow: {} -> {}", concat_file.name, slideshow_path.name)
     proc = await asyncio.create_subprocess_exec(
         *slideshow_cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -1169,7 +1488,9 @@ async def _compose_episode_video_inner(
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
+        logger.error("[Video] ffmpeg slideshow FAILED (rc={}): {}", proc.returncode, stderr.decode()[-500:])
         raise RuntimeError(f"ffmpeg slideshow failed: {stderr.decode()[-500:]}")
+    logger.info("[Video] Slideshow created: {} ({})", slideshow_path, _file_size_str(slideshow_path))
 
     # Step 4: Build per-panel audio (normalize all to same format for concat)
     audio_entries = [e for e in panel_entries if e["audio_path"]]
@@ -1219,6 +1540,7 @@ async def _compose_episode_video_inner(
             audio_lines.append(f"file '{ap_escaped}'")
         audio_concat_file.write_text("\n".join(audio_lines), encoding="utf-8")
 
+        logger.info("[Video] Normalized {} audio clips, merging...", len(normalized_audio_paths))
         merged_audio = work_dir / "merged_audio.mp3"
         audio_merge_cmd = [
             "ffmpeg", "-y",
@@ -1233,11 +1555,14 @@ async def _compose_episode_video_inner(
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
-            logger.warning("Audio concat failed, producing video without audio: {}", stderr.decode()[-300:])
+            logger.warning("[Video] Audio concat FAILED, producing video without audio: {}", stderr.decode()[-300:])
             shutil.copy2(str(slideshow_path), str(final_output))
+            logger.info("[Video] Final output (no audio): {} ({})", final_output, _file_size_str(final_output))
             return str(final_output)
+        logger.info("[Video] Merged audio: {} ({})", merged_audio, _file_size_str(merged_audio))
 
         # Step 5: Merge video + audio
+        logger.info("[Video] Merging video + audio -> {}", final_output)
         merge_cmd = [
             "ffmpeg", "-y",
             "-i", str(slideshow_path),
@@ -1254,11 +1579,14 @@ async def _compose_episode_video_inner(
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
+            logger.error("[Video] ffmpeg merge FAILED (rc={}): {}", proc.returncode, stderr.decode()[-500:])
             raise RuntimeError(f"ffmpeg merge failed: {stderr.decode()[-500:]}")
     else:
         # No audio — just copy slideshow as final output
         shutil.copy2(str(slideshow_path), str(final_output))
+        logger.info("[Video] No audio entries, copied slideshow as final output")
 
+    logger.info("[Video] Final video: {} ({})", final_output, _file_size_str(final_output))
     return str(final_output)
 
 

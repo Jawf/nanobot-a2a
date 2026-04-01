@@ -191,15 +191,18 @@ class AgentLoop:
             ComicStoryboardTTSTool,
             ComicStoryboardVideoTool,
         )
+        comic_sessions_base = self.workspace / "comic_assets"
         comic_script_tool = ComicStoryboardScriptTool(
             provider=self.provider, model=self.model,
             send_callback=self.bus.publish_outbound,
+            sessions_base=comic_sessions_base,
         )
         self.tools.register(comic_script_tool)
         comic_images_tool = ComicStoryboardImagesTool(
             provider=self.provider, model=self.model,
             gemini_service=gemini_svc, script_tool=comic_script_tool,
             send_callback=self.bus.publish_outbound,
+            output_dir=self.workspace / "comic_assets" / "images",
         )
         self.tools.register(comic_images_tool)
         tts_svc = None
@@ -223,6 +226,7 @@ class AgentLoop:
         comic_tts_tool = ComicStoryboardTTSTool(
             tts_service=tts_svc, script_tool=comic_script_tool,
             send_callback=self.bus.publish_outbound,
+            sessions_base=comic_sessions_base,
         )
         self.tools.register(comic_tts_tool)
         self.tools.register(ComicStoryboardVideoTool(
